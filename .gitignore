@@ -1,0 +1,17 @@
+output_buzz
+data/
+venv/
+.safetensors/
+.cache/
+.mypy_cache/
+.ruff_cache/
+.vscode/
+.idea/
+__pycache__
+checkpoints
+dwayner
+fridgem
+himiko
+output_dwayner
+output_himiko
+output_fridge
