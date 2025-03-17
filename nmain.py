@@ -27,12 +27,14 @@ from PIL import Image
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
- 
+
 from templates import imagenet_templates_small, imagenet_style_templates_small
 from textual_inversion_dataset import TextualInversionDataset
 from debug_utils import debug_dataloader
- 
-# scoring time
+
+# ------------------------------------------------------------------------
+# Metrics: FID, CLIPScore
+# ------------------------------------------------------------------------
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.multimodal import CLIPScore
 import torchvision.transforms as T
@@ -46,14 +48,14 @@ logging.basicConfig(
     ]
 )
 logger = get_logger(__name__, log_level="INFO")
- 
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
- 
+
 CONFIG = {
     "pretrained_model": "stabilityai/stable-diffusion-2",
     "what_to_teach": "object",  # Choose between "object" or "style"
-    "placeholder_token": "fridgem",  # The token you'll use to trigger your concept
-    "initializer_token": "fridge",  # A word that describes your concept
+    "placeholder_token": "fridgem",
+    "initializer_token": "fridge",
     "learning_rate": 5e-4,
     "scale_lr": True,  
     "max_train_steps": 2000,
@@ -63,27 +65,27 @@ CONFIG = {
     "gradient_checkpointing": True,
     "mixed_precision": "fp16",
     "seed": 42,
-    "concept_folder": "fridgem",  # 3-5 images of your concept
+    "concept_folder": "fridgem",     # 3-5 images of your concept
 }
 
 # Automatically set output_dir based on concept_folder
 CONFIG["output_dir"] = "output_" + CONFIG["concept_folder"].rstrip("/") + "/"
 os.makedirs(CONFIG["concept_folder"], exist_ok=True)
 os.makedirs(CONFIG["output_dir"], exist_ok=True)
- 
+
 if not os.listdir(CONFIG["concept_folder"]):
     raise ValueError(
         f"The concept folder '{CONFIG['concept_folder']}' is empty! "
         "Please add 3-5 images of your concept before running the training."
     )
- 
+
 def image_grid(imgs: List[Image.Image], rows: int, cols: int) -> Image.Image:
     """Create a grid of images."""
     assert len(imgs) == rows * cols
     w, h = imgs[0].size
     grid = Image.new('RGB', size=(cols*w, rows*h))
     for i, img in enumerate(imgs):
-        grid.paste(img, box=(i%cols*w, i//cols*h))
+        grid.paste(img, box=(i % cols*w, i // cols*h))
     return grid
 
 def setup_model_and_tokenizer(config: Dict) -> tuple:
@@ -94,12 +96,12 @@ def setup_model_and_tokenizer(config: Dict) -> tuple:
     num_added_tokens = tokenizer.add_tokens(config["placeholder_token"])
     if num_added_tokens == 0:
         raise ValueError(f"Token {config['placeholder_token']} already exists!")
-       
+   
     # Get token ids
     token_ids = tokenizer.encode(config["initializer_token"], add_special_tokens=False)
     if len(token_ids) > 1:
         raise ValueError("Initializer token must be a single token!")
-       
+   
     initializer_token_id = token_ids[0]
     placeholder_token_id = tokenizer.convert_tokens_to_ids(config["placeholder_token"])
    
@@ -108,7 +110,7 @@ def setup_model_and_tokenizer(config: Dict) -> tuple:
     vae = AutoencoderKL.from_pretrained(config["pretrained_model"], subfolder="vae")
     unet = UNet2DConditionModel.from_pretrained(config["pretrained_model"], subfolder="unet")
    
-    # Resize token embeddings and initialize our new placeholder token to the initializer token's embedding
+    # Resize token embeddings and initialize our new placeholder token 
     text_encoder.resize_token_embeddings(len(tokenizer))
     token_embeds = text_encoder.get_input_embeddings().weight.data
     token_embeds[placeholder_token_id] = token_embeds[initializer_token_id]
@@ -118,35 +120,23 @@ def setup_model_and_tokenizer(config: Dict) -> tuple:
 def freeze_models(text_encoder, vae, unet, placeholder_token_id):
     """
     Freeze all parameters except for the single row in the embedding table
-    corresponding to our new placeholder token. We do this by:
-      1) Freezing VAE & U-Net completely.
-      2) Freezing all text-encoder parameters except embeddings.
-      3) Registering a grad hook to zero out gradients for *all* embedding rows
-         except the placeholder_token_id row.
+    corresponding to our new placeholder token.
     """
     def freeze_params(params):
         for param in params:
             param.requires_grad = False
-
-    # Freeze VAE & U-Net
     freeze_params(vae.parameters())
     freeze_params(unet.parameters())
 
-    # Freeze most of the text encoder except token embeddings
-    # (encoder, final layer norm, position embeddings, etc.)
     params_to_freeze = itertools.chain(
         text_encoder.text_model.encoder.parameters(),
         text_encoder.text_model.final_layer_norm.parameters(),
         text_encoder.text_model.embeddings.position_embedding.parameters(),
     )
     freeze_params(params_to_freeze)
-
-    # Turn on grad for the entire embedding matrix...
     embedding = text_encoder.get_input_embeddings()
     embedding.weight.requires_grad_(True)
-
-    # ...then zero out gradient updates everywhere except the placeholder row
-    mask = torch.zeros_like(embedding.weight).to(device,dtype=torch.float16)
+    mask = torch.zeros_like(embedding.weight).to(device, dtype=torch.float16)
     mask[placeholder_token_id] = 1.0
 
     def grads_masker(grad):
@@ -171,7 +161,7 @@ def create_dataloader(batch_size, tokenizer):
         batch_size=batch_size,
         shuffle=True
     )
- 
+
 def get_gpu_memory_info():
     """Get current and peak GPU memory usage in GB."""
     if not torch.cuda.is_available():
@@ -195,7 +185,7 @@ def training_function(text_encoder, vae, unet, tokenizer, placeholder_token_id):
     max_train_steps = CONFIG["max_train_steps"]
     output_dir = CONFIG["output_dir"]
     gradient_checkpointing = CONFIG["gradient_checkpointing"]
- 
+   
     # Initialize peak memory tracking
     peak_memory = 0
    
@@ -203,79 +193,76 @@ def training_function(text_encoder, vae, unet, tokenizer, placeholder_token_id):
         gradient_accumulation_steps=gradient_accumulation_steps,
         mixed_precision=CONFIG["mixed_precision"]
     )
- 
+
     if gradient_checkpointing:
         text_encoder.gradient_checkpointing_enable()
         unet.enable_gradient_checkpointing()
- 
+
     train_dataloader = create_dataloader(train_batch_size, tokenizer)
     train_dataset = train_dataloader.dataset
- 
+
     if CONFIG["scale_lr"]:
         learning_rate = (
             learning_rate * gradient_accumulation_steps * train_batch_size * accelerator.num_processes
         )
- 
+
     # We only pass the embedding weights to the optimizer
     optimizer = torch.optim.AdamW(
         [text_encoder.get_input_embeddings().weight],  # single param with grad hook
         lr=learning_rate,
     )
- 
+
     text_encoder, optimizer, train_dataloader = accelerator.prepare(
         text_encoder, optimizer, train_dataloader
     )
- 
+
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
         weight_dtype = torch.float16
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
- 
+
     # Move vae and unet to device
     vae.to(accelerator.device, dtype=weight_dtype)
     unet.to(accelerator.device, dtype=weight_dtype)
- 
+
     # Keep vae in eval mode as we don't train it
     vae.eval()
-    # Keep unet in train mode for gradient checkpointing to work
+    # Keep unet in train mode for gradient checkpointing
     unet.train()
- 
+
     # Initialize noise scheduler
     noise_scheduler = DDPMScheduler.from_pretrained(CONFIG["pretrained_model"], subfolder="scheduler")
- 
+
     # Recalculate total training steps
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / gradient_accumulation_steps)
     num_train_epochs = math.ceil(max_train_steps / num_update_steps_per_epoch)
- 
+
     # Train!
     total_batch_size = train_batch_size * accelerator.num_processes * gradient_accumulation_steps
- 
+
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Instantaneous batch size per device = {train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {max_train_steps}")
- 
+
     progress_bar = tqdm(range(max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
     global_step = 0
- 
+
     pbar = tqdm(range(1, num_train_epochs + 1), desc='Training')
- 
-    upper_limit = 1000
     max_norm = 1
     loss_history = []
     step = 0
 
     for epoch in pbar:
         epoch_loss = 0
-       
         for item in train_dataloader:
             pixel_values = item["pixel_values"].to(device, dtype=weight_dtype)
             input_ids = item["input_ids"].to(device)
- 
+
             latents = vae.encode(pixel_values).latent_dist.sample()
             latents = latents * 0.18215  # VAE scaling factor
 
@@ -291,7 +278,7 @@ def training_function(text_encoder, vae, unet, tokenizer, placeholder_token_id):
             pred_noise = unet(
                 sample=noised_latents,
                 timestep=t,
-                encoder_hidden_states=text_embeddings.last_hidden_state.to(device,dtype=torch.float16)
+                encoder_hidden_states=text_embeddings.last_hidden_state.to(device, dtype=torch.float16)
             ).sample
 
             if noise_scheduler.config.prediction_type == "v_prediction":
@@ -301,15 +288,16 @@ def training_function(text_encoder, vae, unet, tokenizer, placeholder_token_id):
 
             loss = F.mse_loss(pred_noise, target)
             loss_history.append(loss.item())
- 
+
             optimizer.zero_grad()
             accelerator.backward(loss)
             torch.nn.utils.clip_grad_norm_(
                 text_encoder.get_input_embeddings().weight, max_norm=max_norm
             )
             optimizer.step()
-           
+
             if step % CONFIG["save_steps"] == 0 and step > 0:
+                os.makedirs("checkpoints", exist_ok=True)
                 save_progress(text_encoder, placeholder_token_id, accelerator, save_path=f"./checkpoints/{step}.pth")
 
             step += 1
@@ -329,31 +317,28 @@ def training_function(text_encoder, vae, unet, tokenizer, placeholder_token_id):
     os.makedirs(f"{loss_folder}/", exist_ok=True)
     with open(f"./{loss_folder}/{CONFIG['placeholder_token']}.json", "w") as f:
         json.dump(loss_history, f)
-   
+
     logger.info(f"Training completed. Peak GPU memory usage: {peak_memory:.2f}GB")
 
 def main():
     print(f"Starting textual inversion training...")
     print(f"Using concept images from: {CONFIG['concept_folder']}")
     print(f"Number of concept images: {len(os.listdir(CONFIG['concept_folder']))}")
-   
+
     # Set seed for reproducibility
     set_seed(CONFIG["seed"])
-   
-    # ---------------
-    # SETUP MODELS
+
+    # Setup
     tokenizer, text_encoder, vae, unet, placeholder_token_id = setup_model_and_tokenizer(CONFIG)
-   
-    # Debug the dataloader (optional)
+
+    # Optional debug 
     # debug_dataloader(tokenizer, CONFIG)
-   
-    # ---------------
-    # FREEZE AND TRAIN
+
+    # Freeze & train
     freeze_models(text_encoder, vae, unet, placeholder_token_id)
     training_function(text_encoder, vae, unet, tokenizer, placeholder_token_id)
-   
-    # ---------------
-    # SAVE FINAL PIPELINE
+
+    # Save final pipeline
     pipeline = StableDiffusionPipeline.from_pretrained(
         CONFIG["pretrained_model"],
         text_encoder=text_encoder,
@@ -364,20 +349,23 @@ def main():
     pipeline.save_pretrained(CONFIG["output_dir"])
     print(f"Training completed. Model saved to {CONFIG['output_dir']}")
 
-    # ---------------
-    # INFERENCE / EXAMPLES
+    # ---------------------------------------------------
+    # Inference / Generate sample images
+    # ---------------------------------------------------
     pipeline = StableDiffusionPipeline.from_pretrained(CONFIG["output_dir"]).to(device)
     pipeline.to(device, dtype=torch.float16)
     pipeline.scheduler = DPMSolverMultistepScheduler.from_config(pipeline.scheduler.config)
 
     concept = CONFIG["placeholder_token"]
+    # Quick single check
     pipeline_out = pipeline(
         f"A high quality photograph of a {concept}, detailed texture, professional lighting",
         num_inference_steps=50,
         guidance_scale=4
     )
     pipeline_out.images[0].save(os.path.join(CONFIG["output_dir"], f"generated_{concept}.png"))
- 
+
+    # Generate multiple test prompts
     test_prompts = [
         f"a photo of {concept}",
         f"a high quality photograph of {concept}",
@@ -401,6 +389,7 @@ def main():
         ).images[0]
         image.save(os.path.join(CONFIG["output_dir"], "test_samples", f"sample_{i}.png"))
     
+    # Create a grid of original concept images 
     print("Creating a grid of concept images...")
     concept_images = []
     for image_file in os.listdir(CONFIG["concept_folder"]):
@@ -411,11 +400,12 @@ def main():
                 concept_images.append(img)
             except Exception as e:
                 print(f"Error loading image {image_path}: {e}")
-   
+
     if concept_images:
         num_images = len(concept_images)
         cols = min(4, num_images)
         rows = math.ceil(num_images / cols)
+        # Pad if needed
         while len(concept_images) < rows * cols:
             blank = Image.new('RGB', concept_images[0].size, color=(255, 255, 255))
             concept_images.append(blank)
@@ -426,6 +416,39 @@ def main():
         print(f"Concept images grid saved to {concept_grid_path}")
     else:
         print("No valid images found in the concept folder to create a grid.")
+
+    # -------------------------------------------------------------------------
+    # Compute FID Score
+    # -------------------------------------------------------------------------
+    print("\nComputing FID score between real images and generated samples...")
+    fid = FrechetInceptionDistance(feature=2048).to(device)
+
+    fid_transform = T.Compose([
+        T.Resize((299, 299)),
+        T.ToTensor()
+    ])
+
+    # 1) Update FID with real images
+    real_folder = CONFIG["concept_folder"]
+    for img_file in os.listdir(real_folder):
+        if img_file.lower().endswith(('png','jpg','jpeg','bmp','webp')):
+            real_img_path = os.path.join(real_folder, img_file)
+            img = Image.open(real_img_path).convert('RGB')
+            img_tensor = fid_transform(img).unsqueeze(0).to(device)
+            fid.update(img_tensor, real=True)
+
+    # 2) Update FID with generated images
+    gen_folder = os.path.join(CONFIG["output_dir"], "test_samples")
+    for img_file in os.listdir(gen_folder):
+        if img_file.lower().endswith(('png','jpg','jpeg','bmp','webp')):
+            gen_img_path = os.path.join(gen_folder, img_file)
+            img = Image.open(gen_img_path).convert('RGB')
+            img_tensor = fid_transform(img).unsqueeze(0).to(device)
+            fid.update(img_tensor, real=False)
+
+    # 3) Compute FID
+    fid_score = fid.compute()
+    print(f"FID score: {fid_score.item()}\n")
 
 if __name__ == "__main__":
     main()

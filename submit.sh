@@ -9,8 +9,8 @@
 #BSUB -W 0:30
 ### -- set the email address -- 
 #BSUB -u hugomn2002@gmail.com
-# request 6GB of system-memory
-#BSUB -R "rusage[mem=6GB]"
+# request 1GB of system-memory
+#BSUB -R "rusage[mem=1GB]"
 ### -- send notification at start --
 #BSUB -B
 ### -- send notification at completion--
