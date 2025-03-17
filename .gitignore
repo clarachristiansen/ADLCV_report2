@@ -3,6 +3,21 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# DS_store
+.DS_Store
+*.DS_Store 
+
+# Folders
+exercise1/models/ddpm/*
+exercise1/results/ddpm/*
+exercise2/results/DDPM/*
+exercise2/results/DDPM-cfg/*
+exercise1/data/*
+exercise2/data/*
+exercise2/runs/DDPM/*
+exercise2/runs/DDPM-cfg/*
+exercise1/runs/ddpm/*
+
 # C extensions
 *.so
 
